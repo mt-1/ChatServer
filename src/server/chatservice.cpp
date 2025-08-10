@@ -8,7 +8,7 @@ using namespace muduo;
 
 // 获取单例对象的接口函数
 /*
-为什么要设计成单例模式？单例模式有什么好处？讲解一下单例模式是什么
+
 单例模式（Singleton）是一种设计模式，保证一个类只有一个实例，并提供全局访问点。
 在服务端，像 ChatService 这种核心服务类，通常只需要一个实例来管理所有业务和资源，避免多实例带来的资源冲突和数据不一致。
 好处：
@@ -77,7 +77,7 @@ void ChatService::reset()
 
 // 处理登录业务  id pwd
 /*
-为什么这里要注意线程安全？
+
 因为 _userConnMap 这个用户连接表可能会被多个线程同时访问（如多个客户端并发登录、退出、收消息等），
 如果不加锁，可能会出现数据竞争、崩溃或数据错误。
 lock_guard<mutex> 保证同一时刻只有一个线程能修改 _userConnMap，确保数据安全。
@@ -208,7 +208,6 @@ void ChatService::reg(const TcpConnectionPtr &conn, json &js, Timestamp time)
         response["msgid"] = REG_MSG_ACK;
         response["errno"] = 0; // 0表示成功
 
-        // 这是是怎么拿到返回的用户id的？
         /*
         在注册时，_userModel.insert(user) 会把新用户插入数据库，并通过 user.setId(...) 把数据库生成的自增主键 id 设置到 user 对象里。
         所以注册成功后，user.getId() 就能拿到新分配的用户 id。
@@ -255,7 +254,6 @@ void ChatService::clientCloseException(const TcpConnectionPtr &conn)
 {
     User user;
     {
-        // 为什么这里要注意线程安全？
 
         lock_guard<mutex> locak(_connMutex);
         for(auto it = _userConnMap.begin(); it != _userConnMap.end(); ++it)
@@ -285,7 +283,7 @@ void ChatService::clientCloseException(const TcpConnectionPtr &conn)
 // 一对一聊天业务
 void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time)
 {
-    // .get<int>()作用是什么？
+
     int toid = js["toid"].get<int>();
 
     {
@@ -352,7 +350,7 @@ void ChatService::groupChat(const TcpConnectionPtr &conn, json &js, Timestamp ti
     int groupid = js["groupid"].get<int>();
     vector<int> useridVec = _groupModel.queryGroupUsers(userid, groupid);
 
-    // 为什么这里要注意线程安全？
+
     lock_guard<mutex> lock(_connMutex);
     for(int id : useridVec)
     {

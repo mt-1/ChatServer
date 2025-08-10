@@ -2,11 +2,6 @@
 #include "db.h"
 
 
-/*
-sprintf 只是把变量拼接进 SQL 字符串，容易被 SQL 注入攻击。
-参数化查询（Prepared Statement）是数据库驱动提供的安全机制，把 SQL 和数据分开传递，防止注入。
-例如 MySQL C API 的 mysql_stmt_prepare，或 C++ 的 QSqlQuery::prepare，而不是直接拼接字符串。
-*/
 
 // 存储用户的离线消息
 void OfflineMsgModel::insert(int userid, string msg)

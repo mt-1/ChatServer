@@ -3,9 +3,9 @@
 
 
 static string server = "127.0.0.1";
-static string user = "root";
-static string password = "123";
-static string dbname = "chat";
+static string user = "";
+static string password = "";
+static string dbname = "";
 
 
 // 初始化连接数据库
