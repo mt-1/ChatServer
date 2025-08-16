@@ -21,6 +21,7 @@ using json = nlohmann::json;
 #include "group.hpp"
 #include "user.hpp"
 #include "public.hpp"
+#include "protocol.hpp"
 
 // 记录当前系统登录的用户信息
 User g_currentUser;
@@ -37,15 +38,40 @@ sem_t rwsem;
 // 记录登录状态
 atomic_bool g_isLoginSuccess{false};
 
+// 上次收到服务器心跳响应的时间
+std::atomic<time_t> g_lastPong{0}; 
+
+// 心跳线程运行标志
+std::atomic<bool> g_hbRun{true};
+
+// 心跳间隔时间（秒）
+const int HEARTBEAT_INTERVAL = 5;
+
+// 心跳超时阈值（秒）
+const int HEARTBEAT_TIMEOUT = 15;
 
 // 接收线程
 void readTaskHandler(int clientfd);
+
+// 心跳线程
+void heartbeatThread(int clientfd);
+
 // 获取系统时间（聊天信息需要添加时间信息）
 string getCurrentTime();
 // 主聊天页面程序
 void mainMenu(int);
 // 显示当前登录成功用户的基本信息
 void showCurrentUserData();
+
+static void sendFrame(int fd, uint16_t msgid, const json& body)
+{
+    std::string frame = Protocol::encode(msgid, body);
+    if(send(fd, frame.data(), frame.size(), 0) <= 0)
+    {
+        cerr << "send frame error" << endl;
+        return;
+    }
+}
 
 // 聊天客户端程序实现，main线程用作发送线程，子线程用作接收线程
 int main(int argc, char **argv)
@@ -91,6 +117,9 @@ int main(int argc, char **argv)
     std::thread readTask(readTaskHandler, clientfd); // pthread_create
     readTask.detach();                               // pthread_detach
 
+    std::thread hb(heartbeatThread, clientfd);
+    hb.detach(); // 心跳线程
+
     // main线程用于接收用户输入，负责发送数据
     for (;;)
     {
@@ -118,19 +147,16 @@ int main(int argc, char **argv)
             cin.getline(pwd, 50);
 
             json js;
-            js["msgid"] = LOGIN_MSG;
             js["id"] = id;
             js["password"] = pwd;
             string request = js.dump();
 
             g_isLoginSuccess = false;
 
-            int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
-            if (len == -1)
-            {
-                cerr << "send login msg error:" << request << endl;
-            }
+            // int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
+            
 
+            sendFrame(clientfd, LOGIN_MSG, js);
             sem_wait(&rwsem); // 等待信号量，由子线程处理完登录的响应消息后，通知这里
                 
             if (g_isLoginSuccess) 
@@ -151,17 +177,12 @@ int main(int argc, char **argv)
             cin.getline(pwd, 50);
 
             json js;
-            js["msgid"] = REG_MSG;
             js["name"] = name;
             js["password"] = pwd;
-            string request = js.dump();
-
-            int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
-            if (len == -1)
-            {
-                cerr << "send reg msg error:" << request << endl;
-            }
+            // string request = js.dump();
             
+            sendFrame(clientfd, REG_MSG, js);
+
             sem_wait(&rwsem); // 等待信号量，子线程处理完注册消息会通知
         }
         break;
@@ -286,47 +307,127 @@ void doLoginResponse(json &responsejs)
 // 子线程 - 接收线程
 void readTaskHandler(int clientfd)
 {
-    for (;;)
+    std::string cache;
+    cache.reserve(1024);
+    char buf[1024];
+    while(true)
     {
-        char buffer[1024] = {0};
-        int len = recv(clientfd, buffer, 1024, 0);  // 阻塞了
-        if (-1 == len || 0 == len)
+        int n = recv(clientfd, buf, sizeof(buf), 0);
+        if(n <= 0)
         {
             close(clientfd);
             exit(-1);
         }
-
-        // 接收ChatServer转发的数据，反序列化生成json数据对象
-        json js = json::parse(buffer);
-        int msgtype = js["msgid"].get<int>();
-        if (ONE_CHAT_MSG == msgtype)
+        cache.append(buf, n);
+        while(true)
         {
-            cout << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
-                 << " said: " << js["msg"].get<string>() << endl;
-            continue;
-        }
+            if(cache.size() < sizeof(MessageHeader)) break;
+            MessageHeader hdr;
+            memcpy(&hdr, cache.data(), sizeof(hdr));
+            if(hdr.flag != Protocol::FLAG_NUMBER)
+            {
+                std::cerr << "protocol header invalid, close conn" << std::endl;
+                close(clientfd);
+                exit(-1);
+            }
 
-        if (GROUP_CHAT_MSG == msgtype)
-        {
-            cout << "群消息[" << js["groupid"] << "]:" << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
-                 << " said: " << js["msg"].get<string>() << endl;
-            continue;
-        }
+            // 看看是不是完整一帧长度
+            size_t frameLen = sizeof(MessageHeader) + hdr.length;
+            if(cache.size() < frameLen) break;
 
-        if (LOGIN_MSG_ACK == msgtype)
-        {
-            doLoginResponse(js); // 处理登录响应的业务逻辑
-            sem_post(&rwsem);    // 通知主线程，登录结果处理完成
-            continue;
-        }
 
-        if (REG_MSG_ACK == msgtype)
-        {
-            doRegResponse(js);
-            sem_post(&rwsem);    // 通知主线程，注册结果处理完成
-            continue;
+            MessageHeader realHdr;
+            json js;
+            if(!Protocol::decodeOne(cache.data(), frameLen, realHdr, js))
+            {
+                std::cerr << "decode frame failed, close conn, len: " << hdr.length << std::endl;
+                close(clientfd);
+                exit(-1);
+            }
+            cache.erase(0, frameLen);
+
+            if(realHdr.msgid == HEARTBEAT_PONG)
+            {
+                // 更新最后一次收到服务器心跳响应的时间
+                std::cout << "Received heartbeat pong from server." << std::endl;
+                g_lastPong = time(nullptr);
+                continue;
+            }
+            
+            // 分发业务
+            if (ONE_CHAT_MSG == realHdr.msgid)
+            {
+                cout << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
+                    << " said: " << js["msg"].get<string>() << endl;
+                continue;
+            }
+
+            if (GROUP_CHAT_MSG == realHdr.msgid)
+            {
+                cout << "群消息[" << js["groupid"] << "]:" << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
+                    << " said: " << js["msg"].get<string>() << endl;
+                continue;
+            }
+
+            if (LOGIN_MSG_ACK == realHdr.msgid)
+            {
+                doLoginResponse(js); // 处理登录响应的业务逻辑
+                sem_post(&rwsem);    // 通知主线程，登录结果处理完成
+                continue;
+            }
+
+            if (REG_MSG_ACK == realHdr.msgid)
+            {
+                doRegResponse(js);
+                sem_post(&rwsem);    // 通知主线程，注册结果处理完成
+                continue;
+            }
         }
     }
+
+    // for (;;)
+    // {
+    //     char buffer[1024] = {0};
+    //     int len = recv(clientfd, buffer, 1024, 0);  // 阻塞了
+    //     if (-1 == len || 0 == len)
+    //     {
+    //         close(clientfd);
+    //         exit(-1);
+    //     }
+
+    //     cout << "Received data from server: [" << buffer << "]" << endl;
+
+    //     // 接收ChatServer转发的数据，反序列化生成json数据对象
+    //     json js = json::parse(buffer);
+    //     int msgtype = js["msgid"].get<int>();
+    //     if (ONE_CHAT_MSG == msgtype)
+    //     {
+    //         cout << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
+    //              << " said: " << js["msg"].get<string>() << endl;
+    //         continue;
+    //     }
+
+    //     if (GROUP_CHAT_MSG == msgtype)
+    //     {
+    //         cout << "群消息[" << js["groupid"] << "]:" << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
+    //              << " said: " << js["msg"].get<string>() << endl;
+    //         continue;
+    //     }
+
+    //     if (LOGIN_MSG_ACK == msgtype)
+    //     {
+    //         doLoginResponse(js); // 处理登录响应的业务逻辑
+    //         sem_post(&rwsem);    // 通知主线程，登录结果处理完成
+    //         continue;
+    //     }
+
+    //     if (REG_MSG_ACK == msgtype)
+    //     {
+    //         doRegResponse(js);
+    //         sem_post(&rwsem);    // 通知主线程，注册结果处理完成
+    //         continue;
+    //     }
+    // }
 }
 
 // 显示当前登录成功用户的基本信息
@@ -440,16 +541,17 @@ void addfriend(int clientfd, string str)
 {
     int friendid = atoi(str.c_str());
     json js;
-    js["msgid"] = ADD_FRIEND_MSG;
     js["id"] = g_currentUser.getId();
     js["friendid"] = friendid;
-    string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
-    if (-1 == len)
-    {
-        cerr << "send addfriend msg error -> " << buffer << endl;
-    }
+    sendFrame(clientfd, ADD_FRIEND_MSG, js);
+
+    // string buffer = js.dump();
+    // int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    // if (-1 == len)
+    // {
+    //     cerr << "send addfriend msg error -> " << buffer << endl;
+    // }
 }
 // "chat" command handler
 void chat(int clientfd, string str)
@@ -465,19 +567,34 @@ void chat(int clientfd, string str)
     string message = str.substr(idx + 1);
 
     json js;
-    js["msgid"] = ONE_CHAT_MSG;
     js["id"] = g_currentUser.getId();
     js["name"] = g_currentUser.getName();
     js["toid"] = friendid;
     js["msg"] = message;
     js["time"] = getCurrentTime();
-    string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
-    if (-1 == len)
-    {
-        cerr << "send chat msg error -> " << buffer << endl;
-    }
+    // std::string f1 = Protocol::encode(ONE_CHAT_MSG, js);
+    // json js2 = js;
+    // js2["msg"] = std::string("SECOND_")+message;
+    // std::string f2 = Protocol::encode(ONE_CHAT_MSG, js2);
+    // std::string combo = f1 + f2;
+
+    // send(clientfd, combo.data(), combo.size(), 0);
+    sendFrame(clientfd, ONE_CHAT_MSG, js);
+
+
+
+    // string buffer = js.dump();
+    // int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+
+    // if (-1 == len)
+    // {
+    //     cerr << "send chat msg error -> " << combo << endl;
+    // }
+    // else
+    // {
+    //     cout << "send chat msg success -> " << combo << endl;
+    // }
 }
 // "creategroup" command handler  groupname:groupdesc
 void creategroup(int clientfd, string str)
@@ -493,33 +610,35 @@ void creategroup(int clientfd, string str)
     string groupdesc = str.substr(idx + 1, str.size() - idx);
 
     json js;
-    js["msgid"] = CREATE_GROUP_MSG;
     js["id"] = g_currentUser.getId();
     js["groupname"] = groupname;
     js["groupdesc"] = groupdesc;
-    string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
-    if (-1 == len)
-    {
-        cerr << "send creategroup msg error -> " << buffer << endl;
-    }
+    sendFrame(clientfd, CREATE_GROUP_MSG, js);
+
+    // string buffer = js.dump();
+    // int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    // if (-1 == len)
+    // {
+    //     cerr << "send creategroup msg error -> " << buffer << endl;
+    // }
 }
 // "addgroup" command handler
 void addgroup(int clientfd, string str)
 {
     int groupid = atoi(str.c_str());
     json js;
-    js["msgid"] = ADD_GROUP_MSG;
     js["id"] = g_currentUser.getId();
     js["groupid"] = groupid;
-    string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
-    if (-1 == len)
-    {
-        cerr << "send addgroup msg error -> " << buffer << endl;
-    }
+    sendFrame(clientfd, ADD_GROUP_MSG, js);
+
+    // string buffer = js.dump();
+    // int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    // if (-1 == len)
+    // {
+    //     cerr << "send addgroup msg error -> " << buffer << endl;
+    // }
 }
 // "groupchat" command handler   groupid:message
 void groupchat(int clientfd, string str)
@@ -535,37 +654,42 @@ void groupchat(int clientfd, string str)
     string message = str.substr(idx + 1, str.size() - idx);
 
     json js;
-    js["msgid"] = GROUP_CHAT_MSG;
     js["id"] = g_currentUser.getId();
     js["name"] = g_currentUser.getName();
     js["groupid"] = groupid;
     js["msg"] = message;
     js["time"] = getCurrentTime();
-    string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
-    if (-1 == len)
-    {
-        cerr << "send groupchat msg error -> " << buffer << endl;
-    }
+    sendFrame(clientfd, GROUP_CHAT_MSG, js);
+
+    // string buffer = js.dump();
+    // int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    // if (-1 == len)
+    // {
+    //     cerr << "send groupchat msg error -> " << buffer << endl;
+    // }
 }
 // "loginout" command handler
 void loginout(int clientfd, string)
 {
     json js;
-    js["msgid"] = LOGINOUT_MSG;
     js["id"] = g_currentUser.getId();
-    string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
-    if (-1 == len)
-    {
-        cerr << "send loginout msg error -> " << buffer << endl;
-    }
-    else
-    {
-        isMainMenuRunning = false;
-    }   
+    sendFrame(clientfd, LOGINOUT_MSG, js);
+    isMainMenuRunning = false; // 退出主菜单页面
+    g_hbRun = false; // 停止心跳线程
+
+    
+    // string buffer = js.dump();
+    // int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    // if (-1 == len)
+    // {
+    //     cerr << "send loginout msg error -> " << buffer << endl;
+    // }
+    // else
+    // {
+    //     isMainMenuRunning = false;
+    // }   
 }
 
 // 获取系统时间（聊天信息需要添加时间信息）
@@ -579,4 +703,50 @@ string getCurrentTime()
             (int)ptm->tm_hour, (int)ptm->tm_min, (int)ptm->tm_sec);
 
     return std::string(date);
+}
+
+void heartbeatThread(int fd)
+{
+    g_lastPong = time(nullptr);
+    // int pingCount = 0;
+    while(g_hbRun)
+    {
+        // pingCount++;
+        // if(pingCount <= 3)
+        // {
+        //     std::cout << "heartbeat thread running..." << std::endl;
+        //     json ping;
+        //     ping["ts"] = time(nullptr); // 发送心跳包时的时间戳
+        //     sendFrame(fd, HEARTBEAT_PING, ping);
+        // }
+        // else
+        //     std::cout << " simulate heartbeat stop..." << std::endl;
+
+
+        std::cout << "heartbeat thread running..." << std::endl;
+        json ping;
+        ping["ts"] = time(nullptr); // 发送心跳包时的时间戳
+        sendFrame(fd, HEARTBEAT_PING, ping);
+
+
+        for (int i = 0; i<HEARTBEAT_INTERVAL && g_hbRun; ++i)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (time(nullptr) - g_lastPong.load() > HEARTBEAT_TIMEOUT)
+            {
+                cerr << "heartbeat timeout, exit..." << endl;
+                close(fd);
+                exit(-1);
+            }
+        }
+
+        // 每隔HEARTBEAT_INTERVAL秒发送一次心跳包
+        // std::this_thread::sleep_for(chrono::seconds(HEARTBEAT_INTERVAL));
+
+        // for(int i = 0; i < HEARTBEAT_INTERVAL; ++i)
+        // {
+        //     std::this_thread::sleep_for(std::chrono::seconds(1));
+        //     if(!g_hbRun) return; // 如果心跳线程被停止，则退出
+        // }
+    }
 }

@@ -1,14 +1,15 @@
 #include "chatservice.hpp"
 #include "public.hpp"
-
+#include "protocol.hpp"
 #include <muduo/base/Logging.h>
 #include <vector>
+#include <iostream>
 using namespace std;
 using namespace muduo;
 
 // 获取单例对象的接口函数
 /*
-
+为什么要设计成单例模式？单例模式有什么好处？讲解一下单例模式是什么
 单例模式（Singleton）是一种设计模式，保证一个类只有一个实例，并提供全局访问点。
 在服务端，像 ChatService 这种核心服务类，通常只需要一个实例来管理所有业务和资源，避免多实例带来的资源冲突和数据不一致。
 好处：
@@ -35,6 +36,9 @@ ChatService::ChatService()
     _msgHandlerMap.insert({CREATE_GROUP_MSG, std::bind(&ChatService::createGroup, this, _1, _2, _3)});
     _msgHandlerMap.insert({ADD_GROUP_MSG, std::bind(&ChatService::addGroup, this, _1, _2, _3)});
     _msgHandlerMap.insert({GROUP_CHAT_MSG, std::bind(&ChatService::groupChat, this, _1, _2, _3)});
+
+
+    _msgHandlerMap.insert({HEARTBEAT_PING, std::bind(&ChatService::heartbeat, this, _1, _2, _3)});
 
     // 连接redis服务器
     if (_redis.connect())
@@ -77,7 +81,7 @@ void ChatService::reset()
 
 // 处理登录业务  id pwd
 /*
-
+为什么这里要注意线程安全？
 因为 _userConnMap 这个用户连接表可能会被多个线程同时访问（如多个客户端并发登录、退出、收消息等），
 如果不加锁，可能会出现数据竞争、崩溃或数据错误。
 lock_guard<mutex> 保证同一时刻只有一个线程能修改 _userConnMap，确保数据安全。
@@ -101,10 +105,10 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
         {
             // 该用户已经登录，不允许重复登录
             json response;
-            response["msgid"] = LOGIN_MSG_ACK;
             response["errno"] = 2; // 0表示成功
             response["errmsg"] = "该帐号已经登录，请不要重复登录";
-            conn->send(response.dump());
+            // conn->send(response.dump());
+            conn->send(Protocol::encode(LOGIN_MSG_ACK, response));
         }
         else
         {
@@ -123,7 +127,6 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
 
 
             json response;
-            response["msgid"] = LOGIN_MSG_ACK;
             response["errno"] = 0; // 0表示成功
             response["id"] = user.getId();
             response["name"] = user.getName();
@@ -178,7 +181,8 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
                 }
                 response["groups"] = vec3;
             }
-            conn->send(response.dump());
+            // conn->send(response.dump());
+            conn->send(Protocol::encode(LOGIN_MSG_ACK, response));
         }
     }
     else
@@ -188,7 +192,8 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
         response["msgid"] = LOGIN_MSG_ACK;
         response["errno"] = 1;
         response["errmsg"] = "用户名或密码错误";
-        conn->send(response.dump());
+        // conn->send(response.dump());
+        conn->send(Protocol::encode(LOGIN_MSG_ACK, response));
     }
 }
 // 处理注册业务 name password
@@ -208,12 +213,14 @@ void ChatService::reg(const TcpConnectionPtr &conn, json &js, Timestamp time)
         response["msgid"] = REG_MSG_ACK;
         response["errno"] = 0; // 0表示成功
 
+        // 这是是怎么拿到返回的用户id的？
         /*
         在注册时，_userModel.insert(user) 会把新用户插入数据库，并通过 user.setId(...) 把数据库生成的自增主键 id 设置到 user 对象里。
-        所以注册成功后，user.getId() 就能拿到新分配的用户 id。
+        所以注册成功后，user.getId() 就能拿到新分配的用户 id
         */
         response["id"] = user.getId();
-        conn->send(response.dump());
+        // conn->send(response.dump());
+        conn->send(Protocol::encode(REG_MSG_ACK, response));
     }
     else
     {
@@ -221,7 +228,8 @@ void ChatService::reg(const TcpConnectionPtr &conn, json &js, Timestamp time)
         json response;
         response["msgid"] = REG_MSG_ACK;
         response["errno"] = 1; // 1表示失败
-        conn->send(response.dump());
+        // conn->send(response.dump());
+        conn->send(Protocol::encode(REG_MSG_ACK, response));
     }
 }
 
@@ -242,7 +250,6 @@ void ChatService::loginout(const TcpConnectionPtr &conn, json &js, Timestamp tim
 
     // 向redis取消订阅channel(userid)
     _redis.unsubscribe(userid);
-
 
     // 更新用户的状态信息
     User user(userid, "", "", "offline");
@@ -283,7 +290,6 @@ void ChatService::clientCloseException(const TcpConnectionPtr &conn)
 // 一对一聊天业务
 void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time)
 {
-
     int toid = js["toid"].get<int>();
 
     {
@@ -292,7 +298,8 @@ void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time
         if(it != _userConnMap.end())
         {
             // toid在线，转发消息   服务器主动推送消息给toid用户
-            it->second->send(js.dump());
+            // it->second->send(js.dump());
+            it->second->send(Protocol::encode(ONE_CHAT_MSG, js));
             return ;
         }
     }
@@ -350,7 +357,6 @@ void ChatService::groupChat(const TcpConnectionPtr &conn, json &js, Timestamp ti
     int groupid = js["groupid"].get<int>();
     vector<int> useridVec = _groupModel.queryGroupUsers(userid, groupid);
 
-
     lock_guard<mutex> lock(_connMutex);
     for(int id : useridVec)
     {
@@ -358,7 +364,8 @@ void ChatService::groupChat(const TcpConnectionPtr &conn, json &js, Timestamp ti
         if(it != _userConnMap.end())
         {
             // 转发群消息
-            it->second->send(js.dump());
+            // it->second->send(js.dump());
+            it->second->send(Protocol::encode(GROUP_CHAT_MSG, js));
         }
         else
         {
@@ -386,12 +393,33 @@ void ChatService::handleRedisSubscribeMessage(int userid, string message)
     {
         // 用户在线，直接推送消息
         it->second->send(message);
+        // json js = json::parse(message);
+        // uint16_t mid = js.contains("msgid") ? js["msgid"].get<int>() : ONE_CHAT_MSG;
+        // it->second->send(Protocol::encode(mid, js));
+        return ;
     }
 
     // 用户不在线，存储离线消息
     _offlineMsgModel.insert(userid, message);
     
+}
 
+// 心跳处理
+void ChatService::heartbeat(const TcpConnectionPtr &conn, json &js, Timestamp time)
+{
+    // 更新连接最后时间
+    // conn->setContext(time.secondsSinceEpoch());
+    std::cout << "Received PING from " << conn->name() << std::endl;
+
+    // std::cout << "time.now(): " << time.now().toString() 
+    // << "time.secondSinceEpoch" <<  time.secondsSinceEpoch() << std::endl;
+
+    // 回复心跳包
+    json res;
+    res["time"] = time.secondsSinceEpoch();
+    conn->send(Protocol::encode(HEARTBEAT_PONG, res));
+
+    std::cout << "Sent PONG to " << conn->name() << std::endl;
 }
 
 // {"msgid":3,"name":"li si","password":"123456"}

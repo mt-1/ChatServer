@@ -51,6 +51,8 @@ public:
     MsgHandler getHandler(int msgid);
     // 从redis消息队列中获取订阅的消息
     void handleRedisSubscribeMessage(int userid, string message);
+    // 心跳处理
+    void heartbeat(const TcpConnectionPtr &conn, json &js, Timestamp time);
 private:
     // 单例模式？ 构造函数私有化
     ChatService();

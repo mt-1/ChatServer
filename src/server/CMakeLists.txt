@@ -11,8 +11,9 @@ add_executable(ChatServer ${SRC_LIST} ${DB_LIST} ${MODEL_LIST} ${REDIS_LIST})
 # 指定可执行文件链接时需要依赖的库文件
 target_link_libraries(ChatServer muduo_net muduo_base mysqlclient hiredis pthread)
 
-
-
+# 加入协议源文件
+target_sources(ChatServer PRIVATE
+    ../protocol.cpp)
 
 
 

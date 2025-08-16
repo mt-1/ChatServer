@@ -5,6 +5,10 @@
 server和client的公共文件
 
 */
+
+#define HEARTBEAT_PING 1000   // 客户端 -> 服务器
+#define HEARTBEAT_PONG 1001   // 服务器 -> 客户端
+
 enum EnMsgType
 {
     LOGIN_MSG = 1,  // 登录消息
@@ -19,7 +23,6 @@ enum EnMsgType
     GROUP_CHAT_MSG, // 群聊天
     LOGINOUT_MSG, // 退出登录消息
 };
-
 
 
 #endif
