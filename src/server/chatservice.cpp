@@ -9,13 +9,7 @@ using namespace muduo;
 
 // 获取单例对象的接口函数
 /*
-为什么要设计成单例模式？单例模式有什么好处？讲解一下单例模式是什么
-单例模式（Singleton）是一种设计模式，保证一个类只有一个实例，并提供全局访问点。
-在服务端，像 ChatService 这种核心服务类，通常只需要一个实例来管理所有业务和资源，避免多实例带来的资源冲突和数据不一致。
-好处：
-节省资源，避免重复创建对象。
-保证全局唯一性，方便管理和维护。
-提供统一的访问接口。
+
 实现方式：通常用静态成员变量+私有构造函数+静态方法获取实例（如 ChatService::instance()）。
 */
 ChatService *ChatService::instance()
@@ -80,19 +74,6 @@ void ChatService::reset()
 }
 
 // 处理登录业务  id pwd
-/*
-为什么这里要注意线程安全？
-因为 _userConnMap 这个用户连接表可能会被多个线程同时访问（如多个客户端并发登录、退出、收消息等），
-如果不加锁，可能会出现数据竞争、崩溃或数据错误。
-lock_guard<mutex> 保证同一时刻只有一个线程能修改 _userConnMap，确保数据安全。
-
-conn->send(response.dump()); 为什么都要 .dump()？客户端发给服务器是发的什么？服务端返回给客户端是什么？
-.dump() 是把 json 对象序列化成字符串（JSON 格式文本）。
-网络通信只能发送字符串或二进制数据，不能直接发 json 对象。
-客户端发给服务器、服务器返回给客户端的都是JSON 格式的字符串，如：
-{"msgid":1,"id":2,"password":"123456"}
-这样双方都能方便地解析和处理消息内容。
-*/
 void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
 {
     int id = js["id"].get<int>();
@@ -213,11 +194,6 @@ void ChatService::reg(const TcpConnectionPtr &conn, json &js, Timestamp time)
         response["msgid"] = REG_MSG_ACK;
         response["errno"] = 0; // 0表示成功
 
-        // 这是是怎么拿到返回的用户id的？
-        /*
-        在注册时，_userModel.insert(user) 会把新用户插入数据库，并通过 user.setId(...) 把数据库生成的自增主键 id 设置到 user 对象里。
-        所以注册成功后，user.getId() 就能拿到新分配的用户 id
-        */
         response["id"] = user.getId();
         // conn->send(response.dump());
         conn->send(Protocol::encode(REG_MSG_ACK, response));

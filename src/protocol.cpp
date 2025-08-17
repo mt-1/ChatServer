@@ -20,8 +20,10 @@ std::string encode(uint16_t msgid, const json& body) {
     h.msgid = msgid;
     h.check = CHECK;
     h.checksum = crc32(bodyStr);
+
     std::string out;
     out.reserve(sizeof(MessageHeader)+bodyStr.size());
+    // 拼接头部和消息体
     out.append(reinterpret_cast<const char*>(&h), sizeof(h));
     out.append(bodyStr);
     return out;
@@ -32,6 +34,8 @@ bool decodeOne(const char* data, size_t len,
     if (len < sizeof(MessageHeader)) 
         return false;
     std::memcpy(&header, data, sizeof(MessageHeader));
+
+    // 协议校验
     if (header.flag != FLAG_NUMBER || header.check != CHECK) 
         return false;
     if (len < sizeof(MessageHeader)+header.length)
@@ -39,14 +43,10 @@ bool decodeOne(const char* data, size_t len,
     std::string bodyStr(data + sizeof(MessageHeader), header.length);
     if (crc32(bodyStr) != header.checksum) 
         return false;
-    try 
-    { 
-        body = json::parse(bodyStr); 
-    }
-    catch(const json::parse_error&) 
-    { 
-        return false; 
-    }
+
+    // 解析JSON
+    body = json::parse(bodyStr); 
+
     return true;
 }
 }
