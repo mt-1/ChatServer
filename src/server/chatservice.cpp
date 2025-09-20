@@ -12,17 +12,7 @@
 using namespace std;
 using namespace muduo;
 
-// 获取单例对象的接口函数
-/*
-为什么要设计成单例模式？单例模式有什么好处？讲解一下单例模式是什么
-单例模式（Singleton）是一种设计模式，保证一个类只有一个实例，并提供全局访问点。
-在服务端，像 ChatService 这种核心服务类，通常只需要一个实例来管理所有业务和资源，避免多实例带来的资源冲突和数据不一致。
-好处：
-节省资源，避免重复创建对象。
-保证全局唯一性，方便管理和维护。
-提供统一的访问接口。
-实现方式：通常用静态成员变量+私有构造函数+静态方法获取实例（如 ChatService::instance()）。
-*/
+
 ChatService *ChatService::instance()
 {
     static ChatService service;
@@ -54,11 +44,6 @@ ChatService::ChatService()
 }
 
 // 获取消息对应的处理器
-/*
-getHandler 根据消息类型（msgid）返回对应的消息处理函数（Handler）。
-这样主线程收到消息后，可以通过 msgid 查找并调用对应的业务处理逻辑，实现消息分发和解耦。
-如果找不到对应的 Handler，会返回一个空操作并记录错误日志，防止程序崩溃。
-*/
 MsgHandler ChatService::getHandler(int msgid)
 {
     // 记录错误日志，msgid没有对应的事件处理回调
@@ -85,19 +70,6 @@ void ChatService::reset()
 }
 
 // 处理登录业务  id pwd
-/*
-为什么这里要注意线程安全？
-因为 _userConnMap 这个用户连接表可能会被多个线程同时访问（如多个客户端并发登录、退出、收消息等），
-如果不加锁，可能会出现数据竞争、崩溃或数据错误。
-lock_guard<mutex> 保证同一时刻只有一个线程能修改 _userConnMap，确保数据安全。
-
-conn->send(response.dump()); 为什么都要 .dump()？客户端发给服务器是发的什么？服务端返回给客户端是什么？
-.dump() 是把 json 对象序列化成字符串（JSON 格式文本）。
-网络通信只能发送字符串或二进制数据，不能直接发 json 对象。
-客户端发给服务器、服务器返回给客户端的都是JSON 格式的字符串，如：
-{"msgid":1,"id":2,"password":"123456"}
-这样双方都能方便地解析和处理消息内容。
-*/
 void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
 {
     int id = js["id"].get<int>();
@@ -261,7 +233,6 @@ void ChatService::loginout(const TcpConnectionPtr &conn, json &js, Timestamp tim
 void ChatService::clientCloseException(const TcpConnectionPtr &conn)
 {
     if (!conn) {
-        LOG_WARN << "Null connection in clientCloseException";
         return;
     }
 
@@ -278,7 +249,6 @@ void ChatService::clientCloseException(const TcpConnectionPtr &conn)
                 user.setId(it->first);
                 _userConnMap.erase(it);
                 found = true;
-                LOG_INFO << "Removed user " << user.getId() << " from connection map";
                 break;
             }
         }
@@ -288,32 +258,19 @@ void ChatService::clientCloseException(const TcpConnectionPtr &conn)
     if(found && user.getId() > 0)
     {
         int userId = user.getId();
-        LOG_INFO << "[Cleanup] Processing cleanup for user " << userId;
         
-        try {
-            // 同步处理，避免程序退出时异步线程访问已销毁的对象
-            // Redis取消订阅
-            if(!_redis.unsubscribe(userId)) {
-                LOG_ERROR << "[Cleanup] Failed to unsubscribe user " << userId;
-            }
-            
-            // 更新数据库状态
-            User offlineUser;
-            offlineUser.setId(userId);
-            offlineUser.setState("offline");
-            if(_userModel.updateState(offlineUser)) {
-                LOG_INFO << "[Cleanup] Updated user " << userId << " state to offline";
-            } else {
-                LOG_ERROR << "[Cleanup] Failed to update user " << userId << " state";
-            }
-            
-            LOG_INFO << "[Cleanup] Cleanup completed for user " << userId;
-            
-        } catch(const std::exception& e) {
-            LOG_ERROR << "[Cleanup] Exception during cleanup: " << e.what();
-        } catch(...) {
-            LOG_ERROR << "[Cleanup] Unknown exception during cleanup";
-        }
+
+        // 同步处理，避免程序退出时异步线程访问已销毁的对象
+        // Redis取消订阅
+        _redis.unsubscribe(userId);
+        
+        // 更新数据库状态
+        User offlineUser;
+        offlineUser.setId(userId);
+        offlineUser.setState("offline");
+        _userModel.updateState(offlineUser);
+
+
     }
 }
 
@@ -345,13 +302,10 @@ void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time
         }
     }
 
-    cout << "[OneChat] User " << toid << " not found locally" << endl;
-
     // 查询数据库获取用户状态
     User user = _userModel.query(toid);
     string userState = (user.getId() == toid) ? user.getState() : "offline";
-    cout << "[OneChat] User " << toid << " database state: '" << userState << "'" << endl;
-    
+
     if(userState == "online") {   
         bool publishResult = _redis.publish(toid, js.dump());
 
@@ -362,7 +316,6 @@ void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time
     }
 
     // 用户离线，存储离线消息
-
     _offlineMsgModel.insert(toid, js.dump());
 }
 
