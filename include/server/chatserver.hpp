@@ -39,7 +39,7 @@ private:
     // 检查心跳超时
     void checkHeartbeatTimeout();
     // 超时阈值
-    int _heartbeatTimeoutSecond = 20;
+    int _heartbeatTimeoutSecond = 200;
 
     // 所有连接
     std::mutex _allConnsMtx;

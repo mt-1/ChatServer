@@ -4,62 +4,154 @@ using namespace std;
 
 
 Redis::Redis()
-    : _publish_context(nullptr), _subscribe_context(nullptr)
+    : _context_mutexes(POOL_SIZE)
 {
 }
 
 
-Redis::~Redis()
+Redis::~Redis() 
 {
-    if (_publish_context)
-    {
-        redisFree(_publish_context);
+    // 清理发布连接
+    for(size_t i = 0; i < _publish_contexts.size(); i++) {
+        std::lock_guard<std::mutex> lock(_context_mutexes[i]);
+        if(_publish_contexts[i]) {
+            redisFree(_publish_contexts[i]);
+            _publish_contexts[i] = nullptr;
+        }
     }
-    if (_subscribe_context)
-    {
+    
+    // 清理订阅连接
+    if (_subscribe_context) {
         redisFree(_subscribe_context);
+        _subscribe_context = nullptr;
     }
+    
+
 }
 
-bool Redis::connect()
-{
-    // 负责publish订阅消息的上下文连接
-    _publish_context = redisConnect("127.0.0.1", 6379);
-    if(_publish_context == nullptr)
-    {
-        cerr << "Redis publish context connect error!" << endl;
+
+bool Redis::connect() {
+    
+    // 清理旧连接
+    for(size_t i = 0; i < _publish_contexts.size(); i++) {
+        std::lock_guard<std::mutex> lock(_context_mutexes[i]);
+        if(_publish_contexts[i]) {
+            redisFree(_publish_contexts[i]);
+            _publish_contexts[i] = nullptr;
+        }
+    }
+    _publish_contexts.clear();
+    _publish_contexts.resize(POOL_SIZE, nullptr);
+    
+    // 创建连接池
+    for (int i = 0; i < POOL_SIZE; i++) {
+        std::lock_guard<std::mutex> lock(_context_mutexes[i]);
+        
+        redisContext* ctx = redisConnect("127.0.0.1", 6379);
+        if (ctx == nullptr || ctx->err) {
+            // 清理已创建的连接
+            for(int j = 0; j < i; j++) {
+                std::lock_guard<std::mutex> cleanupLock(_context_mutexes[j]);
+                if(_publish_contexts[j]) {
+                    redisFree(_publish_contexts[j]);
+                    _publish_contexts[j] = nullptr;
+                }
+            }
+            return false;
+        }
+        
+        _publish_contexts[i] = ctx;
+
+    }
+    
+    // 创建订阅连接
+    _subscribe_context = redisConnect("127.0.0.1", 6379);
+    if(_subscribe_context == nullptr || _subscribe_context->err) {
         return false;
     }
+    
+    // 启动观察者线程
+    thread t([this] { observer_channel_message(); });
+    t.detach();
 
-    // 负责subscribe订阅消息的上下文连接
-    _subscribe_context = redisConnect("127.0.1", 6379);
-    if(_subscribe_context == nullptr)
-    {
-        cerr << "Redis subscribe context connect error!" << endl;
-        return false;
-    }
-
-    thread t([&]{
-        observer_channel_message();
-    });
-
-    t.detach(); // 分离线程，独立运行
-    cout << "Redis connect success!" << endl;
     return true;
 }
+
+// bool Redis::connect()
+// {
+//     // 负责publish订阅消息的上下文连接
+//     _publish_context = redisConnect("127.0.0.1", 6379);
+//     if(_publish_context == nullptr)
+//     {
+//         cerr << "Redis publish context connect error!" << endl;
+//         return false;
+//     }
+
+//     // 负责subscribe订阅消息的上下文连接
+//     _subscribe_context = redisConnect("127.0.0.1", 6379);
+//     if(_subscribe_context == nullptr)
+//     {
+//         cerr << "Redis subscribe context connect error!" << endl;
+//         return false;
+//     }
+
+//     thread t([&]{
+//         observer_channel_message();
+//     });
+
+//     t.detach(); // 分离线程，独立运行
+//     cout << "Redis connect success!" << endl;
+//     return true;
+// }
+
+
+
+bool Redis::publish(int channel, string message) {
+    if(_publish_contexts.empty()) {
+        cerr << "Redis无连接" << endl;
+        return false;
+    }
+    
+    // 轮询选择连接
+    int index = _current_index.fetch_add(1) % POOL_SIZE;
+    
+    // 锁定特定连接
+    std::lock_guard<std::mutex> lock(_context_mutexes[index]);
+    redisContext* rc = _publish_contexts[index];
+    
+    if (rc->err) {
+        // 重连
+        redisFree(rc);
+        rc = redisConnect("127.0.0.1", 6379);
+        if (rc == nullptr || rc->err) {
+            cerr << "Redis连接失败" << index << endl;
+            _publish_contexts[index] = nullptr;
+            return false;
+        }
+        _publish_contexts[index] = rc;
+    }
+    
+    // 执行发布命令
+    redisReply* reply = (redisReply*)redisCommand(rc, "PUBLISH %d %s", channel, message.c_str());
+    
+    freeReplyObject(reply);
+    
+    return true;
+}
+
 
 // 向redis指定的通道channel发布消息
-bool Redis::publish(int channel, string message)
-{
-    redisReply *reply = (redisReply *)redisCommand(_publish_context, "PUBLISH %d %s", channel, message.c_str());
-    if (reply == nullptr)
-    {
-        cerr << "Redis publish error!" << endl;
-        return false;
-    }
-    freeReplyObject(reply);
-    return true;
-}
+// bool Redis::publish(int channel, string message)
+// {
+//     redisReply *reply = (redisReply *)redisCommand(_publish_context, "PUBLISH %d %s", channel, message.c_str());
+//     if (reply == nullptr)
+//     {
+//         cerr << "Redis publish error!" << endl;
+//         return false;
+//     }
+//     freeReplyObject(reply);
+//     return true;
+// }
 
 // 向redis指定的通道subscribe订阅消息
 bool Redis::subscribe(int channel)
@@ -97,7 +189,9 @@ bool Redis::unsubscribe(int channel)
     }
     // redisBufferWriter可以循环发送缓冲区，知道缓冲区数据发送完毕（done被置为1）
     int done = 0;
-    while(!done)
+    int retry = 0;
+    const int maxtry = 3;
+    while(!done && retry++ < maxtry)
     {
         if(REDIS_ERR == redisBufferWrite(this->_subscribe_context, &done))
         {
@@ -112,20 +206,68 @@ bool Redis::unsubscribe(int channel)
 void Redis::observer_channel_message()
 {
     redisReply *reply = nullptr;
-    while(REDIS_OK == redisGetReply(this->_subscribe_context, (void **)&reply))
+    
+    while(REDIS_OK == redisGetReply(_subscribe_context, (void **)&reply))
     {
-        // 订阅收到的消息格式为：["subscribe", "channel", "message"]
-        if(reply != nullptr && reply->element[2] != nullptr && reply->element[2]->str != nullptr)
+        if(reply == nullptr) 
+            continue;
+        
+        // 安全检查回复格式
+        if(reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3) 
         {
-            // 给业务层上报通道上发生的消息
-            _notify_message_handler(atoi(reply->element[1]->str), reply->element[2]->str);
-        }
+            
+            // 检查消息类型
+            string messageType = (reply->element[0] && reply->element[0]->str) ? 
+                                reply->element[0]->str : "";
+            
+            if(messageType == "subscribe") 
+            {
+                // 订阅确认消息
+                string channel = (reply->element[1] && reply->element[1]->str) ? 
+                                reply->element[1]->str : "unknown";
+                int count = (reply->element[2] && reply->element[2]->integer) ? 
+                            reply->element[2]->integer : 0;
 
+            }
+            else if(messageType == "unsubscribe") 
+            {
+                // 取消订阅确认消息
+                string channel = (reply->element[1] && reply->element[1]->str) ? 
+                                reply->element[1]->str : "unknown";
+                // cout << "[Redis] Unsubscribed from channel " << channel << endl;
+            }
+            else if(messageType == "message") 
+            {
+                // 实际消息
+                if(reply->element[1] && reply->element[1]->str &&
+                    reply->element[2] && reply->element[2]->str) {
+                    
+                    int channel = atoi(reply->element[1]->str);
+                    string msg = reply->element[2]->str;
+
+                    // 调用回调函数处理实际消息
+                    if(_notify_message_handler) 
+                        _notify_message_handler(channel, msg);
+                }
+            }
+            else {
+                cout << messageType << endl;
+            }
+        } else {
+            cout << "无效消息" << reply->type << " elements=" << (reply->elements) << endl;
+        }
+        
+        // 安全释放
+        freeReplyObject(reply);
+        reply = nullptr;
+    }
+    
+    if(reply) {
         freeReplyObject(reply);
     }
 
-    cerr << ">>>>>>>>>> observer_channel_message exit! <<<<<<<<<<<<" << endl;
 }
+
 
 void Redis::init_notify_handler(function<void(int, string)> fn)
 {

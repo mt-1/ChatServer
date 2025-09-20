@@ -4,6 +4,9 @@
 #include <hiredis/hiredis.h>
 #include <thread>
 #include <functional>
+#include <vector>
+#include <mutex>
+#include <atomic>
 using namespace std;
 
 class Redis
@@ -31,8 +34,16 @@ public:
     void init_notify_handler(function<void(int, string)> fn);
 
 private:
+
+    std::vector<redisContext*> _publish_contexts;
+    std::vector<std::mutex> _context_mutexes;
+    // std::mutex _publish_mutex;
+    std::atomic<int> _current_index{0};
+
+    static const int POOL_SIZE = 10;
+
     // hiredis同步上下文对象，负责publish消息
-    redisContext *_publish_context;
+    // redisContext *_publish_context;
 
     // hiredis同步上下文对象，负责subscribe消息
     redisContext *_subscribe_context;

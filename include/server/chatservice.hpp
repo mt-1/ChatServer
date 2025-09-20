@@ -53,9 +53,15 @@ public:
     void handleRedisSubscribeMessage(int userid, string message);
     // 心跳处理
     void heartbeat(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 设置服务器端口
+    void setServerPort(int port) { _serverPort = port; }
+    // 创建唯一标识符
+    string generateUUID();
+
 private:
-    // 单例模式？ 构造函数私有化
+    // 单例模式 构造函数私有化
     ChatService();
+    
 
     // 存储消息id和其对应的业务处理方法
     unordered_map<int, MsgHandler> _msgHandlerMap;
@@ -74,6 +80,11 @@ private:
 
     // redis操作对象
     Redis _redis;
+
+    // 服务器当前端口
+    int _serverPort = -1;
+
+
 };
 
 #endif

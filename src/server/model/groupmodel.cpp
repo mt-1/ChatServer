@@ -1,6 +1,5 @@
 #include "groupmodel.hpp"
-#include "db.h"
-
+#include "connection_pool.h"
 #include <iostream>
 
 // 创建群组
@@ -10,16 +9,21 @@ bool GroupModel::createGroup(Group &group)
     char sql[1024] = {0};
     sprintf(sql, "insert into ALLGroup(groupname, groupdesc) values('%s', '%s')",
             group.getName().c_str(), group.getDesc().c_str());
-    MySQL mysql;
-    if(mysql.connect())
-    {
-        if(mysql.update(sql))
-        {
-            group.setId(mysql_insert_id(mysql.getConnection()));
-            return true; // 插入成功
-        }
+    
+    // 使用连接池
+    ConnectionPool* pool = ConnectionPool::getInstance();
+    auto conn = pool->getConnection();
+    
+    if (conn && mysql_query(conn.get(), sql) == 0) {
+        group.setId(mysql_insert_id(conn.get()));
+        pool->returnConnection(conn);
+        return true;
     }
-    return false; // 插入失败
+    
+    if (conn) {
+        pool->returnConnection(conn);
+    }
+    return false;
 }
 
 
@@ -30,20 +34,15 @@ void GroupModel::addGroup(int userid, int groupid, string role)
     char sql[1024] = {0};
     sprintf(sql, "insert into GroupUser values('%d', '%d', '%s')",
             groupid, userid, role.c_str());
-    MySQL mysql;
-    if(mysql.connect())
-    {
-        mysql.update(sql);
-    }
+    
+    // 使用连接池
+    ConnectionPool* pool = ConnectionPool::getInstance();
+    pool->executeUpdate(sql);
 }
 
 // 查询用户所在群组信息
 vector<Group> GroupModel::queryGroups(int userid)
 {
-    /*
-    1. 先根据userid在groupuser表中查询出该用户所属的群组信息
-    2. 再根据群组信息，查询属于该群组的所有用户的userid，并且和user表进行多表联合查询，查询用户的详细信息
-    */
 
     // 1 组装sql语句
     char sql[1024] = {0};
@@ -52,24 +51,23 @@ vector<Group> GroupModel::queryGroups(int userid)
     
     vector<Group> groupVec;
 
-    MySQL mysql;
-    if(mysql.connect())
+    // 使用连接池
+    ConnectionPool* pool = ConnectionPool::getInstance();
+    MYSQL_RES *res = pool->executeQuery(sql);
+    
+    if(res != nullptr)
     {
-        MYSQL_RES *res = mysql.query(sql);
-        if(res != nullptr)
+        MYSQL_ROW row;
+        // 查出userid所有的群组信息
+        while((row = mysql_fetch_row(res)) != nullptr)
         {
-            MYSQL_ROW row;
-            // 查出userid所有的群组信息
-            while((row = mysql_fetch_row(res)) != nullptr)
-            {
-                Group group;
-                group.setId(atoi(row[0]));
-                group.setName(row[1]);
-                group.setDesc(row[2]);
-                groupVec.push_back(group);
-            }
-            mysql_free_result(res);
+            Group group;
+            group.setId(atoi(row[0]));
+            group.setName(row[1]);
+            group.setDesc(row[2]);
+            groupVec.push_back(group);
         }
+        mysql_free_result(res);
     }
     
     // 查询群组的用户信息
@@ -77,7 +75,8 @@ vector<Group> GroupModel::queryGroups(int userid)
     {
         sprintf(sql, "select a.id, a.name, a.state, b.grouprole from user a inner join \
             GroupUser b on b.userid = a.id where b.groupid=%d", group.getId());
-        MYSQL_RES *res = mysql.query(sql);
+        
+        MYSQL_RES *res = pool->executeQuery(sql);
         if(res != nullptr)
         {
             MYSQL_ROW row;
@@ -106,26 +105,22 @@ vector<int> GroupModel::queryGroupUsers(int userid, int groupid)
     sprintf(sql, "select userid from GroupUser where groupid=%d and userid != %d", groupid, userid);
 
     vector<int> idVec;
-    MySQL mysql;
-    if(mysql.connect())
+    
+    // 使用连接池
+    ConnectionPool* pool = ConnectionPool::getInstance();
+    MYSQL_RES *res = pool->executeQuery(sql);
+    
+    if(res != nullptr)
     {
-        MYSQL_RES *res = mysql.query(sql);
-        if(res != nullptr)
+        MYSQL_ROW row;
+        
+        while((row = mysql_fetch_row(res)) != nullptr)
         {
-            MYSQL_ROW row;
-            
-            while((row = mysql_fetch_row(res)) != nullptr)
-            {
-                
-                idVec.push_back(atoi(row[0]));
-            }
-            mysql_free_result(res);
+            idVec.push_back(atoi(row[0]));
         }
+        mysql_free_result(res);
     }
-    for(int id : idVec)
-    {
-        std::cout << "GroupModel::queryGroupUsers - User ID: " << id << std::endl; // Debug output
-    }
+
     return idVec;
 }
 

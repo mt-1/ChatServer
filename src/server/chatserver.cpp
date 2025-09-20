@@ -8,6 +8,7 @@
 #include <muduo/base/Logging.h>
 #include "protocol.hpp"
 #include <iostream>
+#include <set>
 
 using namespace std;
 using namespace placeholders;
@@ -19,6 +20,10 @@ ChatServer::ChatServer(EventLoop *loop,
                        const string &nameArg)
     : _server(loop, listenAddr, nameArg), _loop(loop)
 {
+
+    int port = listenAddr.port();
+    ChatService::instance()->setServerPort(port);
+
     // 注册链接回调
     _server.setConnectionCallback(std::bind(&ChatServer::onConnection, this, _1));
 
@@ -26,10 +31,10 @@ ChatServer::ChatServer(EventLoop *loop,
     _server.setMessageCallback(std::bind(&ChatServer::onMessage, this, _1, _2, _3));
 
     // 设置线程数量
-    _server.setThreadNum(4);
+    _server.setThreadNum(8);
 
-    // 每10秒检测一次心跳
-    _loop->runEvery(10, std::bind(&ChatServer::checkHeartbeatTimeout, this));
+    // 每100秒检测一次心跳
+    _loop->runEvery(100, std::bind(&ChatServer::checkHeartbeatTimeout, this));
 }
 
 // 启动服务
@@ -38,29 +43,91 @@ void ChatServer::start()
     _server.start();
 }
 
-// 上报链接相关信息的回调函数
+
 void ChatServer::onConnection(const TcpConnectionPtr &conn)
 {
-    // 客户端断开连接
-    if(!conn->connected())
+    if (!conn->connected())
     {
+        // 使用原子操作确保只处理一次
+        static std::mutex disconnectMutex;
+        static std::set<std::string> disconnectingConns;
+        
+        std::string connName = conn->name();
+        
+        {
+            std::lock_guard<std::mutex> lock(disconnectMutex);
+            if (disconnectingConns.count(connName)) {
+                LOG_WARN << "Connection " << connName << " already disconnecting";
+                return;
+            }
+            disconnectingConns.insert(connName);
+        }
+        
+        // 从连接映射中移除
         {
             std::lock_guard<std::mutex> lk(_allConnsMtx);
-            _allConns.erase(conn->name());
+            auto it = _allConns.find(connName);
+            if (it != _allConns.end()) {
+                _allConns.erase(it);
+                LOG_INFO << "Removed connection: " << connName;
+            }
         }
-        ChatService::instance()->clientCloseException(conn);
-
-        conn->shutdown();
+        
+        // 处理业务清理
+        try {
+            ChatService::instance()->clientCloseException(conn);
+        } catch (const std::exception& e) {
+            LOG_ERROR << "Exception in clientCloseException: " << e.what();
+        }
+        
+        // 清理完成后从断开集合中移除
+        {
+            std::lock_guard<std::mutex> lock(disconnectMutex);
+            disconnectingConns.erase(connName);
+        }
+        
+        LOG_INFO << "Connection cleanup completed: " << connName;
     }
     else
     {
-        // 新连接加入
-        // 初始化连接上下文，存储心跳时间
+        // 新连接建立
         conn->setContext(time(nullptr));
         std::lock_guard<std::mutex> lk(_allConnsMtx);
         _allConns[conn->name()] = conn;
+        LOG_INFO << "New connection established: " << conn->name();
     }
 }
+
+
+// 上报链接相关信息的回调函数
+// void ChatServer::onConnection(const TcpConnectionPtr &conn)
+// {
+//     // 客户端断开连接
+//     if(!conn->connected())
+//     {
+//         {
+//             std::lock_guard<std::mutex> lk(_allConnsMtx);
+//             if(_allConns.find(conn->name()) != _allConns.end())
+//                 _allConns.erase(conn->name());
+//             else {
+//                 // 避免重复释放
+//                 LOG_WARN << "Connection " << conn->name() << " already removed";
+//                 return;
+//             }
+//         }
+//         ChatService::instance()->clientCloseException(conn);
+
+//         conn->shutdown();
+//     }
+//     else
+//     {
+//         // 新连接加入
+//         // 初始化连接上下文，存储心跳时间
+//         conn->setContext(time(nullptr));
+//         std::lock_guard<std::mutex> lk(_allConnsMtx);
+//         _allConns[conn->name()] = conn;
+//     }
+// }
 
 // 上报读写事件相关信息的回调函数
 void ChatServer::onMessage(const TcpConnectionPtr &conn,
@@ -83,18 +150,9 @@ void ChatServer::onMessage(const TcpConnectionPtr &conn,
         MessageHeader hdr;
         memcpy(&hdr, buffer->peek(), sizeof(MessageHeader));
 
-
-        std::cout << "parsed frame msgid=" << hdr.msgid
-                  << " length=" << hdr.length
-                  << " flag=" << std::hex << hdr.flag
-                  << " check=" << hdr.check
-                  << " checksum=" << hdr.checksum << std::endl;
-
-
         // 3.基本校验
         if (hdr.flag != Protocol::FLAG_NUMBER)
         {
-            std::cerr << "protocol header invalid";
             conn->shutdown();
             return;
         }
@@ -113,7 +171,6 @@ void ChatServer::onMessage(const TcpConnectionPtr &conn,
         json body;
         if (!Protocol::decodeOne(frame.data(), frame.size(), hdr, body))
         {
-            std::cerr << "decode frame failed, close conn";
             conn->shutdown();
             return;
         }
